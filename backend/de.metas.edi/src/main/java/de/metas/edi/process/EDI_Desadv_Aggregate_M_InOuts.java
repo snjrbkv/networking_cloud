@@ -1,0 +1,172 @@
+package de.metas.edi.process;
+
+/*
+ * #%L
+ * de.metas.edi
+ * %%
+ * Copyright (C) 2015 metas GmbH
+ * %%
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as
+ * published by the Free Software Foundation, either version 2 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program. If not, see
+ * <http://www.gnu.org/licenses/gpl-2.0.html>.
+ * #L%
+ */
+
+import java.util.Iterator;
+
+import de.metas.edi.api.EDIExportStatus;
+import de.metas.edi.api.impl.DesadvBL;
+import lombok.NonNull;
+import org.adempiere.ad.dao.IQueryBL;
+import org.adempiere.ad.dao.IQueryFilter;
+import org.adempiere.ad.trx.api.ITrx;
+import org.adempiere.ad.trx.processor.api.FailTrxItemExceptionHandler;
+import org.adempiere.ad.trx.processor.api.ITrxItemProcessorContext;
+import org.adempiere.ad.trx.processor.api.ITrxItemProcessorExecutor;
+import org.adempiere.ad.trx.processor.api.ITrxItemProcessorExecutorService;
+import org.adempiere.ad.trx.processor.spi.ITrxItemProcessor;
+import org.adempiere.model.InterfaceWrapperHelper;
+import org.compiere.SpringContextHolder;
+import org.compiere.model.IQuery;
+
+import de.metas.document.engine.IDocument;
+import de.metas.edi.model.I_EDI_Document;
+import de.metas.edi.model.I_M_InOut;
+import de.metas.esb.edi.model.I_C_BPartner_EDI_Setting;
+import de.metas.esb.edi.model.I_EDI_Desadv;
+import de.metas.process.JavaProcess;
+import de.metas.process.ProcessInfo;
+import de.metas.util.Services;
+
+/**
+ * Aggregates edi-enabled inOuts into desadv records.
+ */
+public class EDI_Desadv_Aggregate_M_InOuts extends JavaProcess
+{
+	private final IQueryBL queryBL = Services.get(IQueryBL.class);
+	@NonNull private final DesadvBL desadvBL = SpringContextHolder.instance.getBean(DesadvBL.class);
+
+	@Override
+	protected final void prepare()
+	{
+		// nothing
+	}
+
+	@Override
+	protected final String doIt() throws Exception
+	{
+		final ProcessInfo pi = getProcessInfo();
+
+		// this process is supposed to run "globally" on all matching M_InOuts
+		final IQueryFilter<I_M_InOut> processQueryFilter = pi.getQueryFilterOrElseTrue();
+
+		// subquery to select only inOuts whose BPartner (or BPartner+Location) has an active DESADV EDI setting
+		final IQuery<I_C_BPartner_EDI_Setting> ediRecipient = queryBL
+				.createQueryBuilder(I_C_BPartner_EDI_Setting.class, getCtx(), getTrxName())
+				.addOnlyActiveRecordsFilter()
+				.addEqualsFilter(I_C_BPartner_EDI_Setting.COLUMNNAME_IsEdiDesadvRecipient, true).create();
+
+		final Iterator<I_M_InOut> inOuts = queryBL
+				.createQueryBuilder(I_M_InOut.class, getCtx(), getTrxName())
+
+		// the default filters
+				.addOnlyActiveRecordsFilter()
+
+		.addEqualsFilter(I_M_InOut.COLUMNNAME_EDI_Desadv_ID, null) // not yet assigned
+
+		// not yet sent and valid
+		.addEqualsFilter(I_EDI_Document.COLUMNNAME_EDI_ExportStatus, EDIExportStatus.Pending.getCode())
+
+		.addEqualsFilter(org.compiere.model.I_M_InOut.COLUMNNAME_IsSOTrx, true)
+
+		.addInArrayOrAllFilter(org.compiere.model.I_M_InOut.COLUMNNAME_DocStatus,
+				IDocument.STATUS_Completed, IDocument.STATUS_Closed)
+
+		.addNotEqualsFilter(org.compiere.model.I_M_InOut.COLUMNNAME_POReference, null)
+
+		.addInSubQueryFilter(org.compiere.model.I_M_InOut.COLUMNNAME_C_BPartner_ID, I_C_BPartner_EDI_Setting.COLUMNNAME_C_BPartner_ID, ediRecipient)
+
+		// the specific process filter (if any)
+				.filter(processQueryFilter)
+
+		.create()
+				.iterate(I_M_InOut.class);
+
+		final ITrxItemProcessor<I_M_InOut, Void> processor = mkProcessor();
+
+		final ITrxItemProcessorExecutorService executorService = Services.get(ITrxItemProcessorExecutorService.class);
+
+		final ITrxItemProcessorExecutor<I_M_InOut, Void> executor = executorService.<I_M_InOut, Void> createExecutor()
+				.setContext(getCtx(), ITrx.TRXNAME_None)
+				.setExceptionHandler(FailTrxItemExceptionHandler.instance)
+				.setProcessor(processor)
+				.build();
+
+		executor.execute(inOuts);
+
+		return "OK";
+	}
+
+	private ITrxItemProcessor<I_M_InOut, Void> mkProcessor()
+	{
+		return new ITrxItemProcessor<I_M_InOut, Void>()
+		{
+			private ITrxItemProcessorContext processorCtx;
+
+			@Override
+			public void setTrxItemProcessorCtx(final ITrxItemProcessorContext processorCtx)
+			{
+				this.processorCtx = processorCtx;
+			}
+
+			@Override
+			public void process(final I_M_InOut item) throws Exception
+			{
+				// Also add invalid ones. The user can sort it out in the desadv window
+				// final IEDIDocumentBL ediDocumentBL = Services.get(IEDIDocumentBL.class);
+				// final List<Exception> feedback = ediDocumentBL.isValidInOut(item);
+				// if (!feedback.isEmpty())
+				// {
+				// final String errorMessage = ediDocumentBL.buildFeedback(feedback);
+				// throw new AdempiereException(errorMessage);
+				// }
+
+				final String trxNameBackup = InterfaceWrapperHelper.getTrxName(item);
+				try
+				{
+					EDI_Desadv_Aggregate_M_InOuts.this.addLog("@Added@: @M_InOut_ID@ " + item.getDocumentNo());
+					InterfaceWrapperHelper.setTrxName(item, processorCtx.getTrxName());
+					final I_EDI_Desadv desadv = desadvBL.addToDesadvCreateForInOutIfNotExist(item);
+					if (desadv == null)
+					{
+						EDI_Desadv_Aggregate_M_InOuts.this.addLog("Could not create desadv for M_InOut=" + item);
+					}
+					else
+					{
+						InterfaceWrapperHelper.save(item);
+					}
+				}
+				finally
+				{
+					InterfaceWrapperHelper.setTrxName(item, trxNameBackup);
+				}
+			}
+
+			@Override
+			public Void getResult()
+			{
+				return null;
+			}
+		};
+	}
+}

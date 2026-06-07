@@ -1,0 +1,1217 @@
+package de.metas.edi.api.impl;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Multimaps;
+import de.metas.bpartner.BPartnerId;
+import de.metas.bpartner.BPartnerLocationAndCaptureId;
+import de.metas.bpartner.BPartnerLocationId;
+import de.metas.common.util.CoalesceUtil;
+import de.metas.edi.api.DesadvInOutLine;
+import de.metas.edi.api.EDIDesadvId;
+import de.metas.edi.api.EDIDesadvLineId;
+import de.metas.edi.api.EDIDesadvQuery;
+import de.metas.edi.api.EDIExportStatus;
+import de.metas.edi.api.IDesadvDAO;
+import de.metas.edi.api.impl.pack.EDIDesadvPackId;
+import de.metas.edi.api.impl.pack.EDIDesadvPackService;
+import de.metas.edi.model.I_C_Order;
+import de.metas.edi.model.I_C_OrderLine;
+import de.metas.edi.model.I_M_InOut;
+import de.metas.edi.model.I_M_InOutLine;
+import de.metas.esb.edi.model.I_EDI_Desadv;
+import de.metas.esb.edi.model.I_EDI_DesadvLine;
+import de.metas.esb.edi.model.I_M_InOut_Desadv_V;
+import de.metas.handlingunits.IHUPIItemProductBL;
+import de.metas.handlingunits.model.I_M_HU_PI_Item_Product;
+import de.metas.i18n.AdMessageKey;
+import de.metas.i18n.IMsgBL;
+import de.metas.i18n.ITranslatableString;
+import de.metas.inout.IInOutBL;
+import de.metas.inout.IInOutDAO;
+import de.metas.inout.InOutId;
+import de.metas.inout.InOutLineId;
+import de.metas.inoutcandidate.api.IShipmentSchedulePA;
+import de.metas.inoutcandidate.model.I_M_ShipmentSchedule;
+import de.metas.logging.LogManager;
+import de.metas.order.IOrderBL;
+import de.metas.order.IOrderDAO;
+import de.metas.order.OrderId;
+import de.metas.order.OrderLineId;
+import de.metas.organization.OrgId;
+import de.metas.pricing.InvoicableQtyBasedOn;
+import de.metas.process.ProcessExecutionResult;
+import de.metas.process.ProcessInfo;
+import de.metas.product.IProductBL;
+import de.metas.product.IProductDAO;
+import de.metas.product.ProductId;
+import de.metas.product.asidata.ProductASIData;
+import de.metas.product.asidata.ProductASIDataRepository;
+import de.metas.quantity.Quantity;
+import de.metas.quantity.Quantitys;
+import de.metas.quantity.StockQtyAndUOMQty;
+import de.metas.quantity.StockQtyAndUOMQtys;
+import de.metas.report.ReportResultData;
+import de.metas.report.server.ReportConstants;
+import de.metas.uom.IUOMConversionBL;
+import de.metas.uom.IUOMDAO;
+import de.metas.uom.UOMConversionContext;
+import de.metas.uom.UomId;
+import de.metas.util.Check;
+import de.metas.util.Services;
+import de.metas.util.lang.Percent;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+import org.adempiere.ad.trx.api.ITrx;
+import org.adempiere.exceptions.AdempiereException;
+import org.adempiere.model.InterfaceWrapperHelper;
+import org.adempiere.service.ClientId;
+import org.adempiere.service.ISysConfigBL;
+import org.compiere.Adempiere;
+import org.compiere.SpringContextHolder;
+import org.adempiere.mm.attributes.AttributeSetInstanceId;
+import org.compiere.model.I_C_UOM;
+import org.compiere.model.I_M_Product;
+import org.compiere.util.DB;
+import org.slf4j.Logger;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.Nullable;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.stream.Collectors;
+
+import static de.metas.edi.async.spi.impl.EDIWorkpackageProcessor.SYS_CONFIG_OneDesadvPerShipment;
+import static java.math.BigDecimal.ZERO;
+import static org.adempiere.model.InterfaceWrapperHelper.saveRecord;
+
+@Service
+@RequiredArgsConstructor
+public class DesadvBL
+{
+	private final static Logger logger = LogManager.getLogger(DesadvBL.class);
+
+	private static final AdMessageKey MSG_EDI_DESADV_RefuseSending = AdMessageKey.of("EDI_DESADV_RefuseSending");
+	private static final String SYS_CONFIG_MATCH_USING_ORDER_ID = "de.metas.edi.desadv.MatchUsingC_Order_ID";
+	private static final String SYS_CONFIG_MATCH_USING_BPARTNER_ID = "de.metas.edi.desadv.MatchUsingC_BPartner_ID";
+
+	/**
+	 * Process used to print the {@link de.metas.esb.edi.model.I_EDI_Desadv_Pack}s labels
+	 */
+	private static final String AD_PROCESS_VALUE_EDI_DesadvLine_SSCC_Print = "EDI_DesadvLine_SSCC_Print";
+
+	private final transient IInOutDAO inOutDAO = Services.get(IInOutDAO.class);
+	private final transient IInOutBL inOutBL = Services.get(IInOutBL.class);
+	private final transient IDesadvDAO desadvDAO = Services.get(IDesadvDAO.class);
+	private final transient IProductDAO productDAO = Services.get(IProductDAO.class);
+	private final transient IOrderDAO orderDAO = Services.get(IOrderDAO.class);
+	private final transient IOrderBL orderBL = Services.get(IOrderBL.class);
+	private final transient IUOMDAO uomDAO = Services.get(IUOMDAO.class);
+	private final transient IProductBL productBL = Services.get(IProductBL.class);
+	private final IShipmentSchedulePA shipmentSchedulePA = Services.get(IShipmentSchedulePA.class);
+	private final ISysConfigBL sysConfigBL = Services.get(ISysConfigBL.class);
+	private final IHUPIItemProductBL hupiItemProductBL = Services.get(IHUPIItemProductBL.class);
+
+	@NonNull private final transient EDIDesadvPackService ediDesadvPackService;
+	@NonNull private final EDIDesadvInOutLineDAO desadvInOutLineDAO;
+	@NonNull private final EDIBPartnerConfigService ediBpartnerConfigService;
+	@NonNull private final ProductASIDataRepository productASIDataRepository;
+	@NonNull private final EDIDesadvInOutRepository ediDesadvInOutRepository;
+
+	@VisibleForTesting
+	public static DesadvBL newInstanceForUnitTesting()
+	{
+		Adempiere.assertUnitTestMode();
+		//noinspection DataFlowIssue
+		return SpringContextHolder.getBeanOrSupply(DesadvBL.class,
+				() -> new DesadvBL(EDIDesadvPackService.newInstanceForUnitTesting(),
+						EDIDesadvInOutLineDAO.newInstanceForUnitTesting(),
+						EDIBPartnerConfigService.newInstanceForUnitTesting(),
+						new ProductASIDataRepository(Services.get(org.adempiere.ad.dao.IQueryBL.class)),
+						new EDIDesadvInOutRepository())
+		);
+	}
+
+	public I_EDI_Desadv getById(@NonNull final EDIDesadvId id)
+	{
+		return desadvDAO.retrieveById(id);
+	}
+
+	public void save(@NonNull final I_EDI_Desadv ediDesadv)
+	{
+		desadvDAO.save(ediDesadv);
+	}
+
+	public List<I_EDI_DesadvLine> retrieveLinesByIds(final Collection<Integer> desadvLineIds)
+	{
+		return desadvDAO.retrieveLinesByIds(desadvLineIds);
+	}
+
+	public I_EDI_Desadv addToDesadvCreateForOrderIfNotExist(@NonNull final I_C_Order orderRecord)
+	{
+		Check.assumeNotEmpty(orderRecord.getPOReference(), "C_Order {} has a not-empty POReference", orderRecord);
+
+		final I_EDI_Desadv desadvRecord = retrieveOrCreateDesadv(orderRecord);
+		orderRecord.setEDI_Desadv_ID(desadvRecord.getEDI_Desadv_ID());
+
+		final List<I_C_OrderLine> orderLines = orderDAO.retrieveOrderLines(orderRecord, I_C_OrderLine.class);
+		for (final I_C_OrderLine orderLine : orderLines)
+		{
+			if (orderLine.getEDI_DesadvLine_ID() > 0)
+			{
+				continue; // is already assigned to a desadv line
+			}
+			if (orderLine.isPackagingMaterial())
+			{
+				continue; // packing materials from the OL don't belong into the desadv
+			}
+
+			final I_EDI_DesadvLine desadvLine = retrieveOrCreateDesadvLine(orderRecord, desadvRecord, orderLine);
+			Check.errorIf(
+					desadvLine.getM_Product_ID() != orderLine.getM_Product_ID(),
+					"EDI_DesadvLine {} of EDI_Desadv {} has M_Product_ID {} and C_OrderLine {} of C_Order {} has M_Product_ID {}, but both have POReference {} and Line {} ",
+					desadvLine, desadvRecord, desadvLine.getM_Product_ID(),
+					orderLine, orderRecord, orderLine.getM_Product_ID(),
+					orderRecord.getPOReference(), orderLine.getLine());
+
+			orderLine.setEDI_DesadvLine(desadvLine);
+			InterfaceWrapperHelper.save(orderLine);
+		}
+
+		updateFullfilmentPercent(desadvRecord);
+		saveRecord(desadvRecord);
+
+		return desadvRecord;
+	}
+
+	private I_EDI_DesadvLine retrieveOrCreateDesadvLine(
+			@NonNull final I_C_Order orderRecord,
+			@NonNull final I_EDI_Desadv desadvRecord,
+			@NonNull final I_C_OrderLine orderLineRecord)
+	{
+		final I_EDI_DesadvLine existingDesadvLine = desadvDAO.retrieveMatchingDesadvLinevOrNull(
+				desadvRecord,
+				orderLineRecord.getLine(),
+				BPartnerId.ofRepoId(orderLineRecord.getC_BPartner_ID()));
+		if (existingDesadvLine != null)
+		{
+			return existingDesadvLine; // done
+		}
+
+		final ProductId productId = ProductId.ofRepoId(orderLineRecord.getM_Product_ID());
+		final BPartnerId buyerBPartnerId = BPartnerId.ofRepoId(orderRecord.getC_BPartner_ID());
+
+		final I_EDI_DesadvLine newDesadvLine = InterfaceWrapperHelper.newInstance(I_EDI_DesadvLine.class, orderRecord);
+		newDesadvLine.setEDI_Desadv(desadvRecord);
+		newDesadvLine.setLine(orderLineRecord.getLine());
+
+		newDesadvLine.setOrderLine(orderLineRecord.getLine());
+		newDesadvLine.setOrderPOReference(orderRecord.getPOReference());
+
+		final BigDecimal sumOrderedInStockingUOM = desadvRecord.getSumOrderedInStockingUOM().add(orderLineRecord.getQtyOrdered());
+		desadvRecord.setSumOrderedInStockingUOM(sumOrderedInStockingUOM);
+
+		newDesadvLine.setC_UOM_Invoice_ID(orderLineRecord.getPrice_UOM_ID());
+		newDesadvLine.setQtyDeliveredInInvoiceUOM(ZERO);
+
+		// we'll need this when inoutLines are added, because then we need to add either the nominal quantity or the catch-quantity
+		newDesadvLine.setInvoicableQtyBasedOn(orderLineRecord.getInvoicableQtyBasedOn());
+		// this we'll need as well when inoutLines are added, in case there is a TU-UOM involved
+		newDesadvLine.setQtyItemCapacity(orderLineRecord.getQtyItemCapacity());
+
+		newDesadvLine.setQtyEntered(orderLineRecord.getQtyEntered());
+		newDesadvLine.setQtyDeliveredInUOM(ZERO);
+		newDesadvLine.setC_UOM_ID(orderLineRecord.getC_UOM_ID());
+
+		newDesadvLine.setPriceActual(orderLineRecord.getPriceActual());
+
+		newDesadvLine.setQtyOrdered(orderLineRecord.getQtyOrdered());
+		newDesadvLine.setQtyOrdered_Override(getQtyOrdered_Override(orderLineRecord));
+		newDesadvLine.setQtyDeliveredInStockingUOM(ZERO);
+		newDesadvLine.setM_Product_ID(productId.getRepoId());
+
+		newDesadvLine.setProductDescription(orderLineRecord.getProductDescription());
+
+		final I_M_Product product = productDAO.getById(productId);
+
+		//
+		// set infos from M_Product_ASI_Data (ASI-aware, content-based subset matching)
+		final AttributeSetInstanceId orderLineAsiId = AttributeSetInstanceId.ofRepoIdOrNone(orderLineRecord.getM_AttributeSetInstance_ID());
+		final ProductASIData asiData = productASIDataRepository.retrieveBestMatch(productId, buyerBPartnerId, orderLineAsiId);
+
+		newDesadvLine.setProductNo(asiData != null ? asiData.getProductNo() : null);
+		newDesadvLine.setGTIN_CU(CoalesceUtil.firstNotBlank(
+				asiData != null ? asiData.getGtin() : null,
+				product.getGTIN()));
+		newDesadvLine.setUPC_CU(CoalesceUtil.firstNotBlank(
+				asiData != null ? asiData.getUpc() : null,
+				product.getUPC()));
+		newDesadvLine.setEAN_CU(CoalesceUtil.firstNotBlank(
+				asiData != null ? asiData.getEanCU() : null,
+				product.getUPC()/*no EAN on M_Product; UPC plays both roles*/));
+
+		if (Check.isEmpty(newDesadvLine.getProductDescription(), true) && asiData != null)
+		{
+			newDesadvLine.setProductDescription(CoalesceUtil.firstNotBlank(
+					asiData.getProductDescription(),
+					asiData.getProductName()));
+		}
+
+		if (Check.isBlank(newDesadvLine.getProductDescription()))
+		{
+			// fallback for product description
+			newDesadvLine.setProductDescription(product.getName());
+		}
+
+		//
+		// set infos from M_HU_PI_Item_Product
+		final I_M_HU_PI_Item_Product materialItemProduct = hupiItemProductBL.extractHUPIItemProduct(orderRecord, orderLineRecord);
+		newDesadvLine.setGTIN_TU(materialItemProduct.getGTIN());
+		newDesadvLine.setUPC_TU(materialItemProduct.getUPC());
+		newDesadvLine.setEAN_TU(materialItemProduct.getEAN_TU());
+
+		newDesadvLine.setIsSubsequentDeliveryPlanned(false); // the default
+
+		setExternalBPartnerInfo(newDesadvLine, orderLineRecord);
+
+		InterfaceWrapperHelper.save(newDesadvLine);
+		return newDesadvLine;
+	}
+
+	@Nullable
+	private BigDecimal getQtyOrdered_Override(@NonNull final I_C_OrderLine orderLineRecord)
+	{
+		final OrderLineId orderLineId = OrderLineId.ofRepoId(orderLineRecord.getC_OrderLine_ID());
+		final I_M_ShipmentSchedule schedule = shipmentSchedulePA.getByOrderLineId(orderLineId);
+		return getQtyOrdered_Override(schedule);
+	}
+
+	@Nullable
+	private static BigDecimal getQtyOrdered_Override(@Nullable final I_M_ShipmentSchedule schedule)
+	{
+		if (schedule == null)
+		{
+			return null;
+		}
+
+		// When the shipment schedule is closed, the effective ordered qty is whatever was delivered
+		// (no more deliveries expected). This mirrors ShipmentScheduleEffectiveBL.computeQtyOrdered().
+		// Note: any QtyOrdered_Override on a closed schedule is intentionally ignored —
+		// "closed" means "we are done, use actual delivered as the final ordered qty".
+		if (schedule.isClosed())
+		{
+			return schedule.getQtyDelivered();
+		}
+
+		if (InterfaceWrapperHelper.isNull(schedule, I_M_ShipmentSchedule.COLUMNNAME_QtyOrdered_Override))
+		{
+			return null;
+		}
+
+		return schedule.getQtyOrdered_Override();
+	}
+
+	private I_EDI_Desadv retrieveOrCreateDesadv(@NonNull final I_C_Order order)
+	{
+		final EDIDesadvQuery ediDesadvQuery = buildEDIDesadvQuery(order);
+		I_EDI_Desadv desadv = desadvDAO.retrieveMatchingDesadvOrNull(ediDesadvQuery);
+
+		if (desadv == null)
+		{
+			desadv = InterfaceWrapperHelper.newInstance(I_EDI_Desadv.class, order);
+
+			desadv.setPOReference(order.getPOReference());
+			desadv.setDeliveryViaRule(order.getDeliveryViaRule());
+
+			desadv.setC_BPartner_ID(order.getC_BPartner_ID());
+			desadv.setC_BPartner_Location_ID(order.getC_BPartner_Location_ID());
+
+			desadv.setDateOrdered(order.getDateOrdered());
+			desadv.setMovementDate(order.getDatePromised());
+			desadv.setC_Currency_ID(order.getC_Currency_ID());
+
+			// the DESADV recipient might need an explicitly set dropship/handover partner and location; even if it is the same as the buyer's one
+			desadv.setHandOver_Partner_ID(CoalesceUtil.firstGreaterThanZero(order.getHandOver_Partner_ID(), order.getC_BPartner_ID()));
+			desadv.setHandOver_Location_ID(CoalesceUtil.firstGreaterThanZero(order.getHandOver_Location_ID(), order.getC_BPartner_Location_ID()));
+
+			desadv.setDropShip_BPartner_ID(CoalesceUtil.firstGreaterThanZero(order.getDropShip_BPartner_ID(), order.getC_BPartner_ID()));
+			desadv.setDropShip_Location_ID(CoalesceUtil.firstGreaterThanZero(order.getDropShip_Location_ID(), order.getC_BPartner_Location_ID()));
+
+			desadv.setBill_Location_ID(BPartnerLocationAndCaptureId.toBPartnerLocationRepoId(orderBL.getBillToLocationId(order)));
+			// note: the minimal acceptable fulfillment is currently set by a model interceptor
+			InterfaceWrapperHelper.save(desadv);
+		}
+		return desadv;
+	}
+
+	@Nullable
+	public I_EDI_Desadv addToDesadvCreateForInOutIfNotExist(@NonNull final I_M_InOut inOut)
+	{
+		final BPartnerId recipientBPartnerId = BPartnerId.ofRepoId(inOut.getC_BPartner_ID());
+
+		// Walk the inOutLines FIRST and derive the set of source DESADVs from the
+		// orderLine → desadvLine → desadv chain. This makes per-line desadv-line links
+		// the authoritative source of truth for consolidated shipments (where M_InOut.C_Order_ID
+		// may be null), and lets the C_Order_ID branch act as a pure fallback for 1-order
+		// shipments where the order completed before any desadvLine was wired up.
+		//
+		// Sequences are built lazily per DESADV so that pack sequence numbers are independent
+		// across source-order DESADVs when a shipment covers multiple orders.
+		final Map<EDIDesadvId, EDIDesadvPackService.Sequences> sequencesByDesadv = new HashMap<>();
+
+		final List<I_M_InOutLine> inOutLines = inOutDAO.retrieveLines(inOut, I_M_InOutLine.class);
+		for (final I_M_InOutLine inOutLine : inOutLines)
+		{
+			if (inOutLine.getC_OrderLine_ID() <= 0)
+			{
+				continue; // the DESADV-Line needs to relate to an orderline to make sense
+			}
+
+			// Resolve the DESADV for this inOutLine via its order line → desadv line → desadv header.
+			// When the order line has no EDI_DesadvLine_ID set, this line cannot contribute to any
+			// source DESADV (addInOutLine would early-return anyway), so we skip it here.
+			final I_C_OrderLine orderLineRecord = InterfaceWrapperHelper.create(inOutLine.getC_OrderLine(), I_C_OrderLine.class);
+			final EDIDesadvLineId desadvLineId = EDIDesadvLineId.ofRepoIdOrNull(orderLineRecord.getEDI_DesadvLine_ID());
+			if (desadvLineId == null)
+			{
+				continue;
+			}
+			final I_EDI_DesadvLine desadvLineRecord = desadvDAO.retrieveLineById(desadvLineId);
+			final EDIDesadvId lineDesadvId = EDIDesadvId.ofRepoId(desadvLineRecord.getEDI_Desadv_ID());
+
+			final EDIDesadvPackService.Sequences lineSequences = sequencesByDesadv.computeIfAbsent(lineDesadvId, ediDesadvPackService::createSequences);
+
+			addInOutLine(inOutLine, recipientBPartnerId, lineSequences, desadvLineRecord);
+		}
+
+		// If the line walk found source DESADVs, the lowest EDI_Desadv_ID wins as the "primary"
+		// written to M_InOut.EDI_Desadv (legacy single-DESADV header link); the junction table
+		// carries the full set. If no source DESADV was found (e.g. a 1-order shipment whose
+		// order completed before any desadvLine was wired up), fall back to C_Order_ID / POReference.
+		final I_EDI_Desadv primary;
+		if (!sequencesByDesadv.isEmpty())
+		{
+			// Picking the lowest EDI_Desadv_ID is deterministic and matches the legacy single-order
+			// behaviour (where the only candidate desadv was the order's own desadv).
+			// The !isEmpty() guard above makes the orElseThrow path unreachable in practice; it is
+			// kept only to satisfy Optional's API (no Java 10 .orElseThrow() on Java 8).
+			final EDIDesadvId primaryId = sequencesByDesadv.keySet().stream()
+					.min(Comparator.comparingInt(EDIDesadvId::getRepoId))
+					.orElseThrow(() -> new AdempiereException("sequencesByDesadv unexpectedly empty"));
+			primary = desadvDAO.retrieveById(primaryId);
+		}
+		else if (inOut.getC_Order_ID() > 0)
+		{
+			final I_C_Order order = InterfaceWrapperHelper.create(inOut.getC_Order(), I_C_Order.class);
+			if (order.getEDI_Desadv_ID() > 0)
+			{
+				primary = order.getEDI_Desadv();
+			}
+			else
+			{
+				primary = addToDesadvCreateForOrderIfNotExist(order);
+				InterfaceWrapperHelper.save(order);
+			}
+		}
+		else if (Check.isNotBlank(inOut.getPOReference()))
+		{
+			primary = desadvDAO.retrieveMatchingDesadvOrNull(buildEDIDesadvQuery(inOut));
+		}
+		else
+		{
+			primary = null;
+		}
+
+		if (primary == null)
+		{
+			return null;
+		}
+
+		inOut.setEDI_Desadv(primary);
+		final InOutId inOutId = InOutId.ofRepoId(inOut.getM_InOut_ID());
+		// Eager assignDesadvToInOut for the primary covers the case where sequencesByDesadv is empty
+		// (e.g. 1-order shipment with no desadvLines): the junction row still gets written so the
+		// export view sees exactly one source DESADV. assignDesadvToInOut is idempotent, so repeating
+		// it inside the loop below for the same primary is safe.
+		ediDesadvInOutRepository.assignDesadvToInOut(
+				EDIDesadvId.ofRepoId(primary.getEDI_Desadv_ID()),
+				inOutId);
+
+		// For consolidated multi-source-order shipments, write a junction row (EDI_Desadv_M_InOut) for
+		// every distinct source DESADV that contributed lines to this M_InOut, so that the export
+		// view (M_InOut_Export_EDI_DESADV_JSON_V) emits one row per source DESADV.
+		for (final EDIDesadvId perLineDesadvId : sequencesByDesadv.keySet())
+		{
+			ediDesadvInOutRepository.assignDesadvToInOut(perLineDesadvId, inOutId);
+		}
+		return primary;
+	}
+
+	private void addInOutLine(
+			@NonNull final I_M_InOutLine inOutLineRecord,
+			@NonNull final BPartnerId recipientBPartnerId,
+			@NonNull final EDIDesadvPackService.Sequences sequences,
+			@NonNull final I_EDI_DesadvLine desadvLineRecord)
+	{
+		if (inOutLineRecord.getMovementQty().signum() <= 0)
+		{
+			logger.debug("DesadvBL.addInOutLine - M_InOutLine with ID={} has movementQty={}; -> doing nothing",
+					inOutLineRecord.getM_InOutLine_ID(), inOutLineRecord.getMovementQty());
+			return;
+		}
+
+		final I_C_OrderLine orderLineRecord = InterfaceWrapperHelper.create(inOutLineRecord.getC_OrderLine(), I_C_OrderLine.class);
+
+		// Pre-condition (enforced by the caller): the order line has a non-null EDI_DesadvLine_ID
+		// and the passed-in desadvLineRecord is the result of desadvDAO.retrieveLineById(…).
+		// We do NOT re-fetch it here — that would double the DB round-trips on every inOut line.
+
+		final InvoicableQtyBasedOn invoicableQtyBasedOn = InvoicableQtyBasedOn.ofNullableCodeOrNominal(desadvLineRecord.getInvoicableQtyBasedOn());
+		final StockQtyAndUOMQty inOutLineQty = inOutBL.extractInOutLineQty(inOutLineRecord, invoicableQtyBasedOn);
+
+		// update the desadvLineRecord first, so it's always <= the packs' sum and so our validating MI doesn't fail
+		addOrSubtractInOutLineQty(desadvLineRecord,
+				inOutLineQty,
+				InOutLineId.ofRepoId(inOutLineRecord.getM_InOutLine_ID()),
+				orderLineRecord,
+				true/* add */);
+		InterfaceWrapperHelper.save(desadvLineRecord);
+
+		inOutLineRecord.setEDI_DesadvLine_ID(desadvLineRecord.getEDI_DesadvLine_ID());
+		InterfaceWrapperHelper.save(inOutLineRecord);
+
+		ediDesadvPackService.createOrExtendPacks(inOutLineRecord, recipientBPartnerId, sequences);
+	}
+
+	public void removeInOutFromDesadv(final I_M_InOut inOut)
+	{
+		if (inOut.getEDI_Desadv_ID() <= 0)
+		{
+			return;
+		}
+
+		final List<I_M_InOutLine> inOutLines = inOutDAO.retrieveLines(inOut, I_M_InOutLine.class);
+		for (final I_M_InOutLine inOutLine : inOutLines)
+		{
+			removeInOutLineFromDesadv(inOutLine);
+		}
+
+		inOut.setEDI_Desadv_ID(0);
+		InterfaceWrapperHelper.save(inOut);
+	}
+
+	public void removeInOutLineFromDesadv(@NonNull final I_M_InOutLine inOutLineRecord)
+	{
+		if (inOutLineRecord.getEDI_DesadvLine_ID() <= 0)
+		{
+			return;
+		}
+
+		ediDesadvPackService.removePackAndItemRecords(inOutLineRecord);
+
+		final I_EDI_DesadvLine desadvLineRecord = inOutLineRecord.getEDI_DesadvLine();
+
+		final StockQtyAndUOMQty inOutLineQty = inOutBL.extractInOutLineQty(
+				inOutLineRecord,
+				InvoicableQtyBasedOn.ofNullableCodeOrNominal(desadvLineRecord.getInvoicableQtyBasedOn()));
+
+		addOrSubtractInOutLineQty(desadvLineRecord,
+				inOutLineQty,
+				InOutLineId.ofRepoId(inOutLineRecord.getM_InOutLine_ID()),
+				null/*orderLine*/,
+				false/* add=false, i.e. subtract */);
+		InterfaceWrapperHelper.save(desadvLineRecord);
+
+		inOutLineRecord.setEDI_DesadvLine_ID(0);
+		InterfaceWrapperHelper.save(inOutLineRecord);
+	}
+
+	@VisibleForTesting
+	void addOrSubtractInOutLineQty(
+			@NonNull final I_EDI_DesadvLine desadvLineRecord,
+			@NonNull final StockQtyAndUOMQty inOutLineQty,
+			@NonNull final InOutLineId shipmentLineId,
+			@Nullable final I_C_OrderLine orderLine,
+			final boolean add)
+	{
+		final DesadvInOutLine desadvInOutLine = add
+				? getUpdatedDesadvInOutLine(desadvLineRecord, inOutLineQty, shipmentLineId, orderLine)
+				: deleteDesadvInOutLineIfExists(shipmentLineId)
+				.orElseGet(() -> getUpdatedDesadvInOutLine(desadvLineRecord, inOutLineQty, shipmentLineId, orderLine));
+
+		if (add)
+		{
+			desadvInOutLineDAO.save(desadvInOutLine);
+		}
+
+		final BigDecimal inoutLineStockQty = desadvInOutLine
+				.getQtyDeliveredInStockingUOM()
+				.negateIfNot(add)
+				.toBigDecimal();
+
+		final BigDecimal newMovementQty = desadvLineRecord.getQtyDeliveredInStockingUOM().add(inoutLineStockQty);
+		desadvLineRecord.setQtyDeliveredInStockingUOM(newMovementQty);
+
+		final Quantity inoutLineQtyDeliveredInUOM = desadvInOutLine.getQtyDeliveredInUOM().negateIfNot(add);
+		final Quantity desadvLineQtyDelivered = Quantitys.of(
+				desadvLineRecord.getQtyDeliveredInUOM(),
+				UomId.ofRepoId(desadvLineRecord.getC_UOM_ID()));
+
+		final Quantity newQtyDeliveredInUOM = desadvLineQtyDelivered.add(inoutLineQtyDeliveredInUOM);
+		desadvLineRecord.setQtyDeliveredInUOM(newQtyDeliveredInUOM.toBigDecimal());
+
+		final UomId desadvLineBPartnerUOMId = UomId.ofRepoIdOrNull(desadvLineRecord.getC_UOM_BPartner_ID());
+		if (desadvLineBPartnerUOMId != null)
+		{
+			final Quantity inoutLineQtyDeliveredInBPartnerUOM = Optional.ofNullable(desadvInOutLine.getQtyEnteredInBPartnerUOM())
+					.map(qty -> qty.negateIfNot(add))
+					.orElseGet(() -> Quantity.zero(uomDAO.getById(desadvLineBPartnerUOMId)));
+
+			final Quantity desadvLineQtyDeliveredBPartnerUOM = Quantitys.of(
+					desadvLineRecord.getQtyEnteredInBPartnerUOM(),
+					desadvLineBPartnerUOMId);
+
+			final Quantity newQtyDeliveredInBPartnerUOM = desadvLineQtyDeliveredBPartnerUOM.add(inoutLineQtyDeliveredInBPartnerUOM);
+			desadvLineRecord.setQtyEnteredInBPartnerUOM(newQtyDeliveredInBPartnerUOM.toBigDecimal());
+		}
+
+		// convert the delivered qty (which *might* also be in catch-weight!) to the invoicing-UOM
+		final UomId desadvLineInvoiceUomId = UomId.ofRepoIdOrNull(desadvLineRecord.getC_UOM_Invoice_ID());
+		if (desadvLineInvoiceUomId != null)
+		{
+			final Quantity inoutLineQtyDeliveredInInvoiceUOM = Optional
+					.ofNullable(desadvInOutLine.getQtyDeliveredInInvoiceUOM())
+					.map(qty -> qty.negateIfNot(add))
+					.orElseGet(() -> Quantity.zero(uomDAO.getById(desadvLineInvoiceUomId)));
+			final Quantity desadvLineQtyInInvoiceUOM = Quantitys.of(
+					desadvLineRecord.getQtyDeliveredInInvoiceUOM(),
+					desadvLineInvoiceUomId);
+
+			final Quantity newQtyDeliveredInInvoiceUOM = desadvLineQtyInInvoiceUOM.add(inoutLineQtyDeliveredInInvoiceUOM);
+			desadvLineRecord.setQtyDeliveredInInvoiceUOM(newQtyDeliveredInInvoiceUOM.toBigDecimal());
+		}
+
+		// update header record
+		final I_EDI_Desadv desadvRecord = desadvLineRecord.getEDI_Desadv();
+		final BigDecimal newSumDeliveredInStockingUOM = desadvRecord
+				.getSumDeliveredInStockingUOM()
+				.add(inoutLineStockQty);
+		desadvRecord.setSumDeliveredInStockingUOM(newSumDeliveredInStockingUOM);
+		updateFullfilmentPercent(desadvRecord);
+
+		saveRecord(desadvRecord);
+	}
+
+	private Quantity getInOutLineQtyInDesadvLineQtyUOM(
+			@NonNull final StockQtyAndUOMQty inOutLineQty,
+			@NonNull final UomId desadvLineQtyUomId,
+			@NonNull final I_EDI_DesadvLine desadvLineRecord)
+	{
+		final Quantity inOutLineStockQty = inOutLineQty.getStockQty();
+		final Quantity inOutLineLineQtyDelivered = inOutLineQty.getUOMQtyNotNull();
+
+		final Quantity augentQtyDeliveredInUOM;
+
+		final boolean desadvLineQtyIsUOMForTUS = uomDAO.isUOMForTUs(desadvLineQtyUomId);
+		final boolean inOutLineQtyIsUOMForTUS = uomDAO.isUOMForTUs(inOutLineLineQtyDelivered.getUomId());
+		if (desadvLineQtyIsUOMForTUS && !inOutLineQtyIsUOMForTUS)
+		{
+			// We need to take inOutLineStockQty and convert it to "TU-UOM" by using the itemCapacity.
+			final BigDecimal cusPerTU = desadvLineRecord.getQtyItemCapacity();
+			if (cusPerTU.signum() <= 0)
+			{
+				throw new AdempiereException("desadvLineRecord with TU-UOM C_UOM_ID=" + desadvLineQtyUomId.getRepoId() + " needs to have a QtyItemCapacity in order to convert the quantity")
+						.appendParametersToMessage().setParameter("desadvLineRecord", desadvLineRecord);
+			}
+			augentQtyDeliveredInUOM = Quantitys.of(
+					inOutLineStockQty.toBigDecimal().divide(cusPerTU, RoundingMode.CEILING),
+					desadvLineQtyUomId);
+		}
+		else if (!desadvLineQtyIsUOMForTUS && inOutLineQtyIsUOMForTUS)
+		{
+			// We again need to take inOutLineStockQty and this time convert is to desadvLineQtyDelivered's UOM via uom-conversion.
+			augentQtyDeliveredInUOM = inOutLineStockQty;
+		}
+		else
+		{
+			// If both are TU or both are not, then uom-conversion will work fine.
+			// Anyway, if the desadv's quantity is in stock-UOM, then go with the inOutLine's stock-quantity.
+			final boolean desadvUomIsStockUom = inOutLineStockQty.getUomId().equals(desadvLineQtyUomId);
+
+			augentQtyDeliveredInUOM = desadvUomIsStockUom
+					? inOutLineStockQty
+					: inOutLineLineQtyDelivered;
+		}
+
+		final UOMConversionContext conversionCtx = UOMConversionContext.of(desadvLineRecord.getM_Product_ID());
+		final IUOMConversionBL uomConversionBL = Services.get(IUOMConversionBL.class);
+		return uomConversionBL.convertQuantityTo(augentQtyDeliveredInUOM, conversionCtx, desadvLineQtyUomId);
+	}
+
+	public void removeOrderFromDesadv(@NonNull final I_C_Order order)
+	{
+		if (order.getEDI_Desadv_ID() <= 0)
+		{
+			return;
+		}
+
+		final I_EDI_Desadv desadv = order.getEDI_Desadv();
+
+		final List<I_C_OrderLine> orderLines = orderDAO.retrieveOrderLines(order, I_C_OrderLine.class);
+		for (final I_C_OrderLine orderLine : orderLines)
+		{
+			removeOrderLineFromDesadv(orderLine);
+		}
+
+		order.setEDI_Desadv_ID(0);
+		InterfaceWrapperHelper.save(order);
+
+		if (!desadvDAO.hasDesadvLines(desadv)
+				&& !desadvDAO.hasOrders(desadv)
+			/* && !desadvDAO.hasInOuts(desadv) delete, even if there are by some constellation inouts left */
+		)
+		{
+			InterfaceWrapperHelper.delete(desadv);
+		}
+	}
+
+	public void removeOrderLineFromDesadv(@NonNull final I_C_OrderLine orderLine)
+	{
+		if (orderLine.getEDI_DesadvLine_ID() <= 0)
+		{
+			return;
+		}
+
+		final I_EDI_DesadvLine desadvLine = orderLine.getEDI_DesadvLine();
+
+		final I_EDI_Desadv desadvRecord = desadvLine.getEDI_Desadv();
+		final BigDecimal sumOrderedInStockingUOM = desadvRecord.getSumOrderedInStockingUOM().subtract(orderLine.getQtyOrdered());
+		desadvRecord.setSumOrderedInStockingUOM(sumOrderedInStockingUOM);
+		updateFullfilmentPercent(desadvRecord);
+		saveRecord(desadvRecord);
+
+		if (desadvDAO.hasInOutLines(desadvLine))
+		{
+			// not supposed to happen because when we get here, there should be no iol at all, or it's inout should have been reversed and in that case, the iol was already detached by
+			// removeInOutLineFromDesadv.
+		}
+
+		orderLine.setEDI_DesadvLine_ID(0);
+		InterfaceWrapperHelper.save(orderLine);
+
+		if (!desadvDAO.hasOrderLines(desadvLine) && !desadvDAO.hasInOutLines(desadvLine))
+		{
+			InterfaceWrapperHelper.delete(desadvLine);
+		}
+	}
+
+	private void updateFullfilmentPercent(@NonNull final I_EDI_Desadv desadvRecord)
+	{
+		// If we have 99.9, then the result which the user sees shall be 99, not 100. That way it's much more clear to the user.
+		final RoundingMode roundTofloor = RoundingMode.FLOOR;
+
+		final Percent fullfilment = Percent.of(
+				desadvRecord.getSumDeliveredInStockingUOM(),
+				desadvRecord.getSumOrderedInStockingUOM(),
+				0/* precision */,
+				roundTofloor);
+		desadvRecord.setFulfillmentPercent(fullfilment.toBigDecimal());
+	}
+
+	@Nullable
+	public ReportResultData printSSCC18_Labels(
+			@NonNull final Properties ctx,
+			@NonNull final Collection<EDIDesadvPackId> desadvPack_IDs_ToPrint)
+	{
+		Check.assumeNotEmpty(desadvPack_IDs_ToPrint, "desadvPack_IDs_ToPrint not empty");
+
+		//
+		// Create the process info based on AD_Process and AD_PInstance
+		final ProcessExecutionResult result = ProcessInfo.builder()
+				.setCtx(ctx)
+				.setAD_ProcessByValue(AD_PROCESS_VALUE_EDI_DesadvLine_SSCC_Print)
+				//
+				// Parameter: REPORT_SQL_QUERY: provide a different report query which will select from our datasource instead of using the standard query (which is M_HU_ID based).
+				.addParameter(ReportConstants.REPORT_PARAM_SQL_QUERY, "select * from report.fresh_EDI_DesadvLine_SSCC_Label_Report"
+						+ " where AD_PInstance_ID=" + ReportConstants.REPORT_PARAM_SQL_QUERY_AD_PInstance_ID_Placeholder + " "
+						+ " order by EDI_DesadvLine_SSCC_ID")
+				//
+				// Execute the actual printing process
+				.buildAndPrepareExecution()
+				.onErrorThrowException()
+				// Create a selection with the EDI_DesadvLine_Pack_IDs that we need to print.
+				// The report will fetch it from selection.
+				.callBefore(pi -> DB.createT_Selection(pi.getPinstanceId(), desadvPack_IDs_ToPrint, ITrx.TRXNAME_ThreadInherited))
+				.executeSync()
+				.getResult();
+
+		return result.getReportData();
+	}
+
+	public void setMinimumPercentage(@NonNull final I_EDI_Desadv desadv)
+	{
+		final BigDecimal minimumPercentageAccepted = desadvDAO.retrieveMinimumSumPercentage();
+		desadv.setFulfillmentPercentMin(minimumPercentageAccepted);
+	}
+
+	public ImmutableList<ITranslatableString> createMsgsForDesadvsBelowMinimumFulfilment(@NonNull final ImmutableList<I_EDI_Desadv> desadvsRecords)
+	{
+		final ImmutableList.Builder<ITranslatableString> result = ImmutableList.builder();
+		final ImmutableListMultimap<BigDecimal, I_EDI_Desadv> minimum2DesadvRecords = Multimaps.index(desadvsRecords, I_EDI_Desadv::getFulfillmentPercentMin);
+		for (final BigDecimal minimumSumPercentage : minimum2DesadvRecords.keySet())
+		{
+			createSingleMsg(desadvsRecords, minimumSumPercentage).ifPresent(result::add);
+		}
+		return result.build();
+	}
+
+	public List<I_M_InOutLine> retrieveAllInOutLines(final I_EDI_DesadvLine desadvLine)
+	{
+		return desadvDAO.retrieveAllInOutLines(desadvLine);
+	}
+
+	public void updateQtyOrdered_OverrideFromShipSchedAndSave(@NonNull final I_M_ShipmentSchedule schedule)
+	{
+		final OrderLineId orderLineId = OrderLineId.ofRepoId(schedule.getC_OrderLine_ID());
+		final I_C_OrderLine orderLineRecord = orderDAO.getOrderLineById(orderLineId, I_C_OrderLine.class);
+		final EDIDesadvLineId ediDesadvLineId = EDIDesadvLineId.ofRepoIdOrNull(orderLineRecord.getEDI_DesadvLine_ID());
+		if (ediDesadvLineId == null)
+		{
+			return;
+		}
+
+		final I_EDI_DesadvLine desadvLineRecord = desadvDAO.retrieveLineById(ediDesadvLineId);
+		final BigDecimal qtyOrdered_Override = getQtyOrdered_Override(schedule);
+		desadvLineRecord.setQtyOrdered_Override(qtyOrdered_Override);
+		desadvDAO.save(desadvLineRecord);
+	}
+
+	public void propagateEDIStatus(@NonNull final I_EDI_Desadv desadv)
+	{
+		// should always be opposite of recomputeDesadvStatusFromInOuts
+		if (isOneDesadvPerShipment(desadv))
+		{
+			return;
+		}
+
+		final String ediExportStatus = Check.assumeNotNull(desadv.getEDI_ExportStatus(), "EDI_ExportStatus is not null; EDI_DesadvID={}", desadv.getEDI_Desadv_ID());
+		desadvDAO.retrieveShipmentsWithStatus(desadv, ImmutableSet.of(EDIExportStatus.SendingStarted))
+				.stream()
+				.peek(shipment -> shipment.setEDI_ExportStatus(ediExportStatus))
+				.forEach(inOutBL::save);
+	}
+
+	public boolean isMatchUsingOrderId(@NonNull final ClientId clientId)
+	{
+		return sysConfigBL.getBooleanValue(SYS_CONFIG_MATCH_USING_ORDER_ID,
+				false,
+				clientId.getRepoId());
+	}
+
+	private Optional<ITranslatableString> createSingleMsg(
+			@NonNull final List<I_EDI_Desadv> desadvsToSkip,
+			@NonNull final BigDecimal minimumSumPercentage)
+	{
+		final StringBuilder skippedDesadvsString = new StringBuilder();
+
+		for (final I_EDI_Desadv desadvRecord : desadvsToSkip)
+		{
+			if (desadvRecord.getFulfillmentPercent().compareTo(desadvRecord.getFulfillmentPercentMin()) < 0)
+			{
+				skippedDesadvsString.append("#")
+						.append(desadvRecord.getDocumentNo())
+						.append(" - ")
+						.append(desadvRecord.getFulfillmentPercent())
+						.append("\n");
+			}
+		}
+
+		if (skippedDesadvsString.length() <= 0)
+		{
+			return Optional.empty(); // nothing to log
+		}
+
+		// log a message that includes all the skipped lines'documentNo and percentage
+		final ITranslatableString msg = Services.get(IMsgBL.class).getTranslatableMsgText(
+				MSG_EDI_DESADV_RefuseSending,
+				minimumSumPercentage, skippedDesadvsString.toString());
+		return Optional.of(msg);
+	}
+
+	@NonNull
+	private Optional<Quantity> computeDeliveredQtyInBPartnerUOM(
+			@NonNull final I_C_OrderLine orderLine,
+			@NonNull final Quantity qtyDeliveredInStockUOM)
+	{
+		if (orderLine.getC_UOM_BPartner_ID() <= 0)
+		{
+			return Optional.empty();
+		}
+
+		final UomId stockUOMId = productBL.getStockUOMId(orderLine.getM_Product_ID());
+		final I_C_UOM stockUOM = uomDAO.getById(stockUOMId);
+
+		//dev-note: calculating deliveredQtyInBPartnerUOM using proportion to avoid missing UOM conversion between
+		//BPartner_UOM_ID - which might not be considered at all in metas internal processing - and actual stock UOM
+		final BigDecimal deliveredQtyInBPartnerUOM = qtyDeliveredInStockUOM.toBigDecimal()
+				.multiply(orderLine.getQtyEnteredInBPartnerUOM())
+				.divide(orderLine.getQtyOrdered(), stockUOM.getStdPrecision(), RoundingMode.HALF_UP);
+
+		final I_C_UOM bpartnerUOM = uomDAO.getById(orderLine.getC_UOM_BPartner_ID());
+		if (deliveredQtyInBPartnerUOM.signum() < 0)
+		{
+			return Optional.of(Quantity.zero(bpartnerUOM));
+		}
+
+		return Optional.of(Quantity.of(deliveredQtyInBPartnerUOM, bpartnerUOM));
+	}
+
+	@NonNull
+	private Optional<Quantity> computeDeliveredQtyInBPartnerUOM(
+			@NonNull final I_EDI_DesadvLine desadvLine,
+			@NonNull final Quantity qtyDeliveredInStockUOM)
+	{
+		if (desadvLine.getC_UOM_BPartner_ID() <= 0 || qtyDeliveredInStockUOM.signum() == 0)
+		{
+			return Optional.empty();
+		}
+
+		final I_C_UOM bpartnerUOM = uomDAO.getById(desadvLine.getC_UOM_BPartner_ID());
+		if (desadvLine.getQtyEnteredInBPartnerUOM().signum() <= 0)
+		{
+			return Optional.of(Quantity.zero(bpartnerUOM)); // return zero and don't run the risk of an ArithmeticException if both the new and old value are zero.
+		}
+
+		final UomId stockUOMId = productBL.getStockUOMId(desadvLine.getM_Product_ID());
+		final I_C_UOM stockUOM = uomDAO.getById(stockUOMId);
+
+		//dev-note: calculating deliveredQtyInBPartnerUOM using proportion to avoid missing UOM conversion between
+		//BPartner_UOM_ID - which might not be considered at all in metas internal processing - and actual stock UOM
+		final BigDecimal deliveredQtyInBPartnerUOM = qtyDeliveredInStockUOM.toBigDecimal()
+				.multiply(desadvLine.getQtyEnteredInBPartnerUOM())
+				.divide(desadvLine.getQtyDeliveredInStockingUOM(), stockUOM.getStdPrecision(), RoundingMode.HALF_UP);
+
+		if (deliveredQtyInBPartnerUOM.signum() < 0)
+		{
+			return Optional.of(Quantity.zero(bpartnerUOM));
+		}
+
+		return Optional.of(Quantity.of(deliveredQtyInBPartnerUOM, bpartnerUOM));
+	}
+
+	@NonNull
+	private DesadvInOutLine getUpdatedDesadvInOutLine(
+			@NonNull final I_EDI_DesadvLine desadvLineRecord,
+			@NonNull final StockQtyAndUOMQty inOutLineQty,
+			@NonNull final InOutLineId shipmentLineId,
+			@Nullable final I_C_OrderLine orderLine)
+	{
+		final ProductId productId = ProductId.ofRepoId(desadvLineRecord.getM_Product_ID());
+		final DesadvInOutLine.DesadvInOutLineBuilder desadvInOutLineBuilder = desadvInOutLineDAO.getByInOutLineId(shipmentLineId)
+				.map(DesadvInOutLine::toBuilder)
+				.orElseGet(() -> DesadvInOutLine.builder()
+						.orgId(OrgId.ofRepoId(desadvLineRecord.getAD_Org_ID()))
+						.productId(ProductId.ofRepoId(desadvLineRecord.getM_Product_ID()))
+						.desadvLineId(EDIDesadvLineId.ofRepoId(desadvLineRecord.getEDI_DesadvLine_ID()))
+						.shipmentLineId(shipmentLineId)
+						.qtyEnteredInBPartnerUOM(Optional.of(desadvLineRecord.getC_UOM_BPartner_ID())
+								.map(UomId::ofRepoIdOrNull)
+								.map(bpartnerUOMId -> Quantitys.of(ZERO, bpartnerUOMId))
+								.orElse(null)));
+
+		final Quantity inOutLineStockQty = inOutLineQty.getStockQty();
+		desadvInOutLineBuilder.qtyDeliveredInStockingUOM(inOutLineStockQty);
+
+		final Quantity inoutQtyDeliveredInUOM = getInOutLineQtyInDesadvLineQtyUOM(
+				inOutLineQty, UomId.ofRepoId(desadvLineRecord.getC_UOM_ID()), desadvLineRecord);
+
+		desadvInOutLineBuilder.qtyDeliveredInUOM(inoutQtyDeliveredInUOM);
+
+		final Optional<Quantity> newQtyEnteredInBPartnerUOM = orderLine != null
+				? computeDeliveredQtyInBPartnerUOM(orderLine, inOutLineStockQty)
+				: computeDeliveredQtyInBPartnerUOM(desadvLineRecord, inOutLineStockQty);
+
+		newQtyEnteredInBPartnerUOM.ifPresent(desadvInOutLineBuilder::qtyEnteredInBPartnerUOM);
+
+		// convert the delivered qty (which *might* also be in catch-weight!) to the invoicing-UOM
+		final UomId invoiceUomId = UomId.ofRepoIdOrNull(desadvLineRecord.getC_UOM_Invoice_ID());
+		if (invoiceUomId != null)
+		{
+			final Quantity newQtyDeliveredInInvoiceUOM =
+					getInOutLineQtyInDesadvLineQtyUOM(inOutLineQty, invoiceUomId, desadvLineRecord);
+
+			desadvInOutLineBuilder.qtyDeliveredInInvoiceUOM(newQtyDeliveredInInvoiceUOM);
+		}
+
+		final Quantity desadvLineQtyDeliveredInStockUOM = StockQtyAndUOMQtys
+				.ofQtyInStockUOM(desadvLineRecord.getQtyDeliveredInStockingUOM(), productId).getStockQty();
+		desadvInOutLineBuilder.desadvTotalQtyDeliveredInStockingUOM(inOutLineStockQty.add(desadvLineQtyDeliveredInStockUOM));
+
+		return desadvInOutLineBuilder.build();
+	}
+
+	@NonNull
+	private Optional<DesadvInOutLine> deleteDesadvInOutLineIfExists(
+			@NonNull final InOutLineId shipmentLineId)
+	{
+		final Optional<DesadvInOutLine> desadvInOutLine = desadvInOutLineDAO.getByInOutLineId(shipmentLineId);
+		desadvInOutLine.ifPresent(desadvInOutLineDAO::delete);
+
+		return desadvInOutLine;
+	}
+
+	@NonNull
+	private EDIDesadvQuery buildEDIDesadvQuery(@NonNull final I_C_Order order)
+	{
+		final String poReference = Check.assumeNotNull(order.getPOReference(),
+				"In the DESADV-Context, POReference is mandatory; C_Order_ID={}",
+				order.getC_Order_ID());
+		final EDIDesadvQuery.EDIDesadvQueryBuilder ediDesadvQueryBuilder = EDIDesadvQuery.builder()
+				.poReference(poReference)
+				.ctxAware(InterfaceWrapperHelper.getContextAware(order));
+
+		if (isMatchUsingBPartnerId())
+		{
+			ediDesadvQueryBuilder.bPartnerId(BPartnerId.ofRepoId(order.getC_BPartner_ID()));
+		}
+
+		if (isMatchUsingOrderId(ClientId.ofRepoId(order.getAD_Client_ID())))
+		{
+			ediDesadvQueryBuilder.orderId(OrderId.ofRepoId(order.getC_Order_ID()));
+		}
+
+		return ediDesadvQueryBuilder
+				.build();
+	}
+
+	@NonNull
+	private EDIDesadvQuery buildEDIDesadvQuery(@NonNull final I_M_InOut inOut)
+	{
+		final String poReference = Check.assumeNotNull(inOut.getPOReference(),
+				"In the DESADV-Context, POReference is mandatory; M_InOut_ID={}",
+				inOut.getM_InOut_ID());
+		final EDIDesadvQuery.EDIDesadvQueryBuilder ediDesadvQueryBuilder = EDIDesadvQuery.builder()
+				.poReference(poReference)
+				.ctxAware(InterfaceWrapperHelper.getContextAware(inOut));
+
+		if (isMatchUsingBPartnerId())
+		{
+			ediDesadvQueryBuilder.bPartnerId(BPartnerId.ofRepoId(inOut.getC_BPartner_ID()));
+		}
+
+		return ediDesadvQueryBuilder
+				.build();
+	}
+
+	private boolean isMatchUsingBPartnerId()
+	{
+		return sysConfigBL.getBooleanValue(SYS_CONFIG_MATCH_USING_BPARTNER_ID, false);
+	}
+
+	private static void setExternalBPartnerInfo(@NonNull final I_EDI_DesadvLine newDesadvLine, @NonNull final I_C_OrderLine orderLineRecord)
+	{
+		newDesadvLine.setExternalSeqNo(orderLineRecord.getExternalSeqNo());
+		newDesadvLine.setC_UOM_BPartner_ID(orderLineRecord.getC_UOM_BPartner_ID());
+		newDesadvLine.setQtyEnteredInBPartnerUOM(ZERO);
+		newDesadvLine.setBPartner_QtyItemCapacity(orderLineRecord.getBPartner_QtyItemCapacity());
+	}
+
+	@NonNull
+	public I_M_InOut_Desadv_V getInOutDesadvByInOutIdAndDesadvId(@NonNull final InOutId shipmentId, @NonNull final EDIDesadvId desadvId)
+	{
+		return desadvDAO.getInOutDesadvByInOutIdAndDesadvId(shipmentId, desadvId);
+	}
+
+	@NonNull
+	public  BPartnerId getEffectiveDropshipPartnerId(@NonNull final I_EDI_Desadv desadv)
+	{
+		return CoalesceUtil.coalesceSuppliersNotNull(
+				() -> BPartnerId.ofRepoIdOrNull(desadv.getDropShip_BPartner_ID()),
+				() -> BPartnerId.ofRepoIdOrNull(desadv.getC_BPartner_ID())
+		);
+	}
+
+	@NonNull
+	public BPartnerLocationId getEffectiveDropshipLocationId(@NonNull final I_EDI_Desadv desadv)
+	{
+		return CoalesceUtil.coalesceSuppliersNotNull(
+				() -> BPartnerLocationId.ofRepoIdOrNull(desadv.getDropShip_BPartner_ID(), desadv.getDropShip_Location_ID()),
+				() -> BPartnerLocationId.ofRepoIdOrNull(desadv.getC_BPartner_ID(), desadv.getC_BPartner_Location_ID()));
+	}
+
+	@NonNull
+	public List<I_M_InOut> retrieveAllInOuts(final I_EDI_Desadv desadv)
+	{
+		return desadvDAO.retrieveAllInOuts(desadv);
+	}
+
+	@NonNull
+	public List<I_EDI_DesadvLine> retrieveAllDesadvLines(@NonNull final I_EDI_Desadv desadv)
+	{
+		return desadvDAO.retrieveAllDesadvLines(desadv);
+	}
+
+	@NonNull
+	public List<I_C_Order> retrieveAllOrders(final I_EDI_Desadv desadv)
+	{
+		return desadvDAO.retrieveAllOrders(desadv);
+	}
+
+	public boolean isOneDesadvPerShipment(@NonNull final EDIDesadvId desadvId)
+	{
+		return isOneDesadvPerShipment(getById(desadvId));
+	}
+
+	public boolean isOneDesadvPerShipment(@NonNull final I_EDI_Desadv desadv)
+	{
+		if(sysConfigBL.getBooleanValue(SYS_CONFIG_OneDesadvPerShipment, false))
+		{
+			return true;
+		}
+
+		final BPartnerLocationId bpl = getEffectiveDropshipLocationId(desadv);
+		return ediBpartnerConfigService.isDESADVExternalSystemRecipient(bpl);
+
+	}
+
+	/**
+	 * Recomputes the DESADV export status based on the statuses of all linked shipments (M_InOut).
+	 * <p>
+	 * This applies only when {@link #isOneDesadvPerShipment(I_EDI_Desadv)} returns true
+	 * (either via sysconfig or when using ExternalSystem for this BPartner).
+	 * In this mode, each shipment is exported individually, so the DESADV status is derived from
+	 * the aggregate of all shipment statuses, rather than being set manually.
+	 * <p>
+	 * Rules are evaluated top-to-bottom, first match wins:
+	 * <ol>
+	 *   <li>Any linked InOut is Invalid → DESADV Invalid + aggregated error message</li>
+	 *   <li>Any linked InOut is Error (and none Invalid) → DESADV Error + aggregated error message</li>
+	 *   <li>All linked InOuts are Sent or DontSend AND FulfillmentPercent >= 100% → DESADV Sent, clear error message</li>
+	 *   <li>Any linked InOut is Pending, Enqueued, or SendingStarted, OR FulfillmentPercent < 100% → DESADV Pending, clear error message</li>
+	 * </ol>
+	 */
+	public void recomputeDesadvStatusFromInOuts(@NonNull final EDIDesadvId desadvId)
+	{
+		final I_EDI_Desadv desadv = desadvDAO.retrieveById(desadvId);
+
+		// should always be opposite of propagateEDIStatus
+		if (!isOneDesadvPerShipment(desadv))
+		{
+			logger.debug("Skipping recompute for DESADV {} (not in per-shipment mode)", desadvId);
+			return;
+		}
+
+		final List<I_M_InOut> allInOuts = desadvDAO.retrieveAllInOuts(desadv);
+
+		if (allInOuts.isEmpty())
+		{
+			logger.debug("No InOuts linked to DESADV {}, keeping current status", desadvId);
+			return;
+		}
+
+		final List<I_M_InOut> invalidInOuts = allInOuts.stream()
+				.filter(inOut -> EDIExportStatus.ofCode(inOut.getEDI_ExportStatus()).isInvalid())
+				.collect(ImmutableList.toImmutableList());
+
+		final List<I_M_InOut> errorInOuts = allInOuts.stream()
+				.filter(inOut -> EDIExportStatus.ofCode(inOut.getEDI_ExportStatus()).isError())
+				.collect(ImmutableList.toImmutableList());
+
+		if (!invalidInOuts.isEmpty())
+		{
+			final String aggregatedError = buildAggregatedErrorMessage(invalidInOuts);
+			desadv.setEDI_ExportStatus(EDIExportStatus.Invalid.getCode());
+			desadv.setEDIErrorMsg(aggregatedError);
+			desadvDAO.save(desadv);
+			logger.info("DESADV {} set to Invalid due to {} invalid InOuts: {}", desadvId, invalidInOuts.size(), aggregatedError);
+			return;
+		}
+
+		if (!errorInOuts.isEmpty())
+		{
+			final String aggregatedError = buildAggregatedErrorMessage(errorInOuts);
+			desadv.setEDI_ExportStatus(EDIExportStatus.Error.getCode());
+			desadv.setEDIErrorMsg(aggregatedError);
+			desadvDAO.save(desadv);
+			logger.info("DESADV {} set to Error due to {} error InOuts: {}", desadvId, errorInOuts.size(), aggregatedError);
+			return;
+		}
+
+		final boolean allProcessed = allInOuts.stream()
+				.allMatch(inOut -> EDIExportStatus.ofCode(inOut.getEDI_ExportStatus()).isProcessed());
+
+		final BigDecimal fulfillmentPercent = desadv.getFulfillmentPercent();
+
+		if (allProcessed && fulfillmentPercent.compareTo(BigDecimal.valueOf(100)) >= 0)
+		{
+			final boolean containsSentInOuts = allInOuts.stream().anyMatch(inOut -> EDIExportStatus.ofCode(inOut.getEDI_ExportStatus()).isSent());
+			final EDIExportStatus ediExportStatus = containsSentInOuts ? EDIExportStatus.Sent : EDIExportStatus.DontSend;
+			desadv.setEDI_ExportStatus(ediExportStatus.getCode());
+			desadv.setEDIErrorMsg(null);
+			desadvDAO.save(desadv);
+			logger.info("DESADV {} auto-closed to Sent (all InOuts sent/don't send, fulfillment {}%)", desadvId, fulfillmentPercent);
+			return;
+		}
+
+		desadv.setEDI_ExportStatus(EDIExportStatus.Pending.getCode());
+		desadv.setEDIErrorMsg(null);
+		desadvDAO.save(desadv);
+		logger.debug("DESADV {} set to Pending (fulfillment {}%, allProcessed={})", desadvId, fulfillmentPercent, allProcessed);
+	}
+
+	/**
+	 * Builds a formatted message listing multiple InOuts with their status and optional error details.
+	 * <p>
+	 * Examples:
+	 * <ul>
+	 *   <li>For error aggregation: "Shipment 1234: error message; InOut 5678: another error"</li>
+	 * </ul>
+	 */
+	public String buildAggregatedErrorMessage(@NonNull final List<I_M_InOut> inOuts)
+	{
+
+			return inOuts.stream()
+					.map(inOut -> {
+						final String docNo = inOut.getDocumentNo();
+						final String errorMsg = Check.isBlank(inOut.getEDIErrorMsg())
+								? "No error message"
+								: inOut.getEDIErrorMsg();
+						return "Shipment " + docNo + ": " + errorMsg;
+					})
+					.collect(Collectors.joining("; "));
+	}
+
+	/**
+	 * Reopens a processed DESADV to Pending when a new InOut is linked.
+	 * <p>
+	 * Only applies when {@link #isOneDesadvPerShipment(I_EDI_Desadv)} is true
+	 * (per-shipment export mode via sysconfig or ExternalSystem).
+	 */
+	public void reopenDesadvIfNeeded(@NonNull final EDIDesadvId desadvId)
+	{
+		final I_EDI_Desadv desadv = desadvDAO.retrieveById(desadvId);
+
+		if (!isOneDesadvPerShipment(desadv))
+		{
+			return;
+		}
+
+		final EDIExportStatus currentStatus = EDIExportStatus.ofCode(desadv.getEDI_ExportStatus());
+		if (currentStatus.isProcessed())
+		{
+			desadv.setEDI_ExportStatus(EDIExportStatus.Pending.getCode());
+			desadv.setEDIErrorMsg(null);
+			desadvDAO.save(desadv);
+			logger.info("DESADV {} reopened to Pending (new InOut linked to previously-closed DESADV)", desadvId);
+		}
+	}
+}
