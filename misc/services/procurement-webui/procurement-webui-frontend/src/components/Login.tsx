@@ -55,7 +55,6 @@ const Login: FunctionComponent<Props> = inject('store')(
         return (
             <View>
                 <div className="container p-4 pb-6 login-view">
-                    <h1>hello</h1>
                     <div className="login-logo pb-6">
                         <img src="../../static/media/logo.png" className="logo" />
                     </div>
